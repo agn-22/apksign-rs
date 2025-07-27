@@ -3,11 +3,10 @@ use log::info;
 use std::cmp::max;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
-use std::ops::Add;
 use std::path::Path;
 use thiserror::Error;
 
-fn reverse_search<R: Read + Seek>(reader: &mut R, pat: &[u8]) -> std::io::Result<Option<u64>> {
+fn reverse_search(mut reader: impl Read + Seek, pat: &[u8]) -> std::io::Result<Option<u64>> {
     if pat.is_empty() {
         return Ok(None);
     }
@@ -25,7 +24,7 @@ fn reverse_search<R: Read + Seek>(reader: &mut R, pat: &[u8]) -> std::io::Result
         let read_len = curr_pos - next_pos;
         chunk_buf.clear();
         reader.seek(SeekFrom::Start(next_pos))?;
-        reader.take(read_len).read_to_end(&mut chunk_buf)?;
+        (&mut reader).take(read_len).read_to_end(&mut chunk_buf)?;
         chunk_buf.extend_from_slice(&carry_buf);
 
         if let Some(pos) = chunk_buf
@@ -46,53 +45,88 @@ fn reverse_search<R: Read + Seek>(reader: &mut R, pat: &[u8]) -> std::io::Result
     return Ok(None);
 }
 
-fn read_le_to_u32<R: Read>(reader: &mut R) -> std::io::Result<u32> {
+fn read_le_to_u32(mut reader: impl Read) -> std::io::Result<u32> {
     let mut buf = [0u8; 4];
     reader.read_exact(&mut buf)?;
     Ok(u32::from_le_bytes(buf))
 }
 
-fn read_le_to_u64<R: Read>(reader: &mut R) -> std::io::Result<u64> {
+fn read_le_to_u64(mut reader: impl Read) -> std::io::Result<u64> {
     let mut buf = [0u8; 8];
     reader.read_exact(&mut buf)?;
     Ok(u64::from_le_bytes(buf))
 }
 
+fn read_into_vector(mut reader: impl Read, size: usize) -> std::io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; size];
+    reader.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn parse_u32_len_prefixed_value(bytes: &[u8]) -> Result<(&[u8], &[u8]), AppError> {
+    let (first_4_bytes, rem_bytes) = bytes
+        .split_at_checked(4)
+        .ok_or(AppError::ParseError("len prefix value parse error".into()))?;
+    let first_4_bytes: [u8; 4] = first_4_bytes.try_into().unwrap();
+    let len = u32::from_le_bytes(first_4_bytes);
+    let (value, rem_bytes) = rem_bytes
+        .split_at_checked(len as usize)
+        .ok_or(AppError::ParseError("len prefix value parse error".into()))?;
+    return Ok((value, rem_bytes));
+}
+
+fn parse_u32_len_prefix_sequence(mut seq: &[u8]) -> Result<Vec<&[u8]>, AppError> {
+    let mut values = Vec::<&[u8]>::new();
+    while !seq.is_empty() {
+        let (value, rem) = parse_u32_len_prefixed_value(seq)?;
+        values.push(value);
+        seq = rem;
+    }
+    return Ok(values);
+}
+
 const EOCD_MAGIC_NUMBER: [u8; 4] = [0x50, 0x4B, 0x05, 0x06];
 const APK_SIG_BLOCK_MAGIC: &str = "APK Sig Block 42";
 const APK_SIG_V2_BLOCK_ID: u32 = 0x7109871a;
+const APK_SIG_V3_BLOCK_ID: u32 = 0xf05368c0;
 
 #[derive(Error, Debug)]
-enum AppEror {
+enum AppError {
     #[error("IO Error")]
     IoError(#[from] std::io::Error),
     #[error("Parse Error")]
     ParseError(String),
 }
 
+#[derive(Debug)]
 struct ApkSigInfo {
     v2_block: Option<V2Block>,
     v3_block: Option<V3Block>,
 }
 
+#[derive(Debug)]
 struct V2Block {
     signers: Vec<V2Signer>,
 }
 
+#[derive(Debug)]
 struct V3Block {}
 
+#[derive(Debug)]
 struct V2Signer {
     signed_data: V2SignedData,
     signatures: Vec<Signature>,
     public_key: PublicKey,
 }
 
+#[derive(Debug)]
 struct V2SignedData {
     digests: Vec<Digest>,
     certificates: Vec<Certificate>,
     additional_attributes: Vec<AdditionalAttribute>,
 }
 
+#[derive(Debug)]
 struct Signature {
     signature_algorithm_id: u32,
     signature_over_signed_data: Vec<u8>,
@@ -100,6 +134,7 @@ struct Signature {
 
 type PublicKey = Vec<u8>;
 
+#[derive(Debug)]
 struct Digest {
     signature_algorithm_id: u32,
     digest: Vec<u8>,
@@ -107,19 +142,20 @@ struct Digest {
 
 type Certificate = Vec<u8>;
 
+#[derive(Debug)]
 struct AdditionalAttribute {
     id: u32,
     value: Vec<u8>,
 }
 
 impl ApkSigInfo {
-    pub fn parse<P: AsRef<Path>>(path: P) -> Result<Self, AppEror> {
+    pub fn parse<P: AsRef<Path>>(path: P) -> Result<Self, AppError> {
         let mut apk_file = File::open(path)?;
 
         apk_file.seek(SeekFrom::End(0))?;
         let eocd_magic_number_pos = reverse_search(&mut apk_file, &EOCD_MAGIC_NUMBER)?;
         let Some(eocd_magic_number_pos) = eocd_magic_number_pos else {
-            return Err(AppEror::ParseError(
+            return Err(AppError::ParseError(
                 "EOCD magic number not found, not a zip file".into(),
             ));
         };
@@ -133,10 +169,9 @@ impl ApkSigInfo {
         let start_of_cd_pos = offset_of_start_of_cd as u64;
         let magic_pos = start_of_cd_pos - APK_SIG_BLOCK_MAGIC.len() as u64;
         apk_file.seek(SeekFrom::Start(magic_pos))?;
-        let mut magic = [0u8; 16];
-        apk_file.read(&mut magic)?;
+        let magic = read_into_vector(&mut apk_file, 16)?;
         if magic != APK_SIG_BLOCK_MAGIC.as_bytes() {
-            return Err(AppEror::ParseError(
+            return Err(AppError::ParseError(
                 "APK signing block magic not found where expected".into(),
             ));
         };
@@ -150,36 +185,146 @@ impl ApkSigInfo {
         apk_file.seek(SeekFrom::Start(size_of_block_at_start_pos))?;
         let size_of_block_at_start = read_le_to_u64(&mut apk_file)?;
         if size_of_block != size_of_block_at_start {
-            return Err(AppEror::ParseError(
+            return Err(AppError::ParseError(
                 "size of block fields don't match".into(),
             ));
         }
 
-        info!("size of block: {}", size_of_block);
+        info!("apk signing block size: {}", size_of_block);
 
         apk_file.seek(SeekFrom::Start(seq_pos))?;
         let seq_len = size_of_block_pos - seq_pos;
 
+        let mut apk_sig_info = Self {
+            v2_block: None,
+            v3_block: None,
+        };
+
         let mut parsed_len = 0;
         while parsed_len < seq_len {
-            let seq_item_len = read_le_to_u64(&mut apk_file)?;
+            let seq_item_len = read_le_to_u64(apk_file.by_ref())?;
             let id = read_le_to_u32(&mut apk_file)?;
-            if (id == APK_SIG_V2_BLOCK_ID) {}
+            let value_len = read_le_to_u32(&mut apk_file)?;
+            let value = read_into_vector(apk_file.by_ref(), value_len as usize)?;
+            match id {
+                APK_SIG_V2_BLOCK_ID => apk_sig_info.v2_block = Some(Self::parse_v2_block(value)?),
+                APK_SIG_V3_BLOCK_ID => apk_sig_info.v3_block = Some(Self::parse_v3_block(value)?),
+                _ => {}
+            }
             parsed_len += 8 + seq_item_len;
         }
 
-        Ok(ApkSigInfo {
-            v2_block: None,
-            v3_block: None,
+        Ok(apk_sig_info)
+    }
+
+    fn parse_v2_block(value: Vec<u8>) -> Result<V2Block, AppError> {
+        let signers = parse_u32_len_prefix_sequence(&value)?;
+        let signers: Result<Vec<V2Signer>, AppError> =
+            signers.into_iter().map(Self::parse_v2_signer).collect();
+        Ok(V2Block { signers: signers? })
+    }
+
+    fn parse_v3_block(value: Vec<u8>) -> Result<V3Block, AppError> {
+        todo!()
+    }
+
+    fn parse_v2_signer(signer_bytes: &[u8]) -> Result<V2Signer, AppError> {
+        let (signed_data, rem_bytes) = parse_u32_len_prefixed_value(signer_bytes)?;
+        let (signatures, rem_bytes) = parse_u32_len_prefixed_value(rem_bytes)?;
+        let (public_key, rem_bytes) = parse_u32_len_prefixed_value(rem_bytes)?;
+
+        assert!(rem_bytes.len() == 0, "Bytes remaining to be parsed");
+
+        let signed_data = Self::parse_v2_signed_data(signed_data)?;
+
+        let signatures = parse_u32_len_prefix_sequence(signatures)?;
+        let signatures: Result<Vec<Signature>, AppError> =
+            signatures.into_iter().map(Self::parse_signature).collect();
+        let signatures = signatures?;
+
+        let public_key: Vec<u8> = public_key.into();
+
+        Ok(V2Signer {
+            signed_data,
+            signatures,
+            public_key,
         })
     }
 
-    fn parse_v2_block(value: &[u8]) -> V2Block {
-        todo!()
+    fn parse_v2_signed_data(signed_data_bytes: &[u8]) -> Result<V2SignedData, AppError> {
+        let (digests_seq, rem_bytes) = parse_u32_len_prefixed_value(signed_data_bytes)?;
+        let (certificates_seq, rem_bytes) = parse_u32_len_prefixed_value(rem_bytes)?;
+        let (additional_attributes_seq, _rem) = parse_u32_len_prefixed_value(rem_bytes)?; //TODO Return error if bytes remaining
+
+        let digests = parse_u32_len_prefix_sequence(digests_seq)?;
+        let certificates = parse_u32_len_prefix_sequence(certificates_seq)?;
+        let additional_attributes = parse_u32_len_prefix_sequence(additional_attributes_seq)?;
+
+        let digests: Result<Vec<Digest>, AppError> =
+            digests.into_iter().map(Self::parse_digest).collect();
+
+        let certificates: Result<Vec<Certificate>, AppError> = certificates
+            .into_iter()
+            .map(Self::parse_certificate)
+            .collect();
+
+        let additional_attributes: Result<Vec<AdditionalAttribute>, AppError> =
+            additional_attributes
+                .into_iter()
+                .map(Self::parse_additional_attribute)
+                .collect();
+
+        Ok(V2SignedData {
+            digests: digests?,
+            certificates: certificates?,
+            additional_attributes: additional_attributes?,
+        })
     }
 
-    fn parse_v3_block(value: &[u8]) -> V3Block {
-        todo!()
+    fn parse_signature(signature_bytes: &[u8]) -> Result<Signature, AppError> {
+        let (sig_algo_id_bytes, signature_data) = signature_bytes
+            .split_at_checked(4)
+            .ok_or(AppError::ParseError("Signature parse error".into()))?;
+        let sig_algo_id_bytes: [u8; 4] = sig_algo_id_bytes.try_into().unwrap();
+        let (signature_bytes, _rem) = parse_u32_len_prefixed_value(signature_data)?; //TODO Return error if bytes remaining
+        Ok(Signature {
+            signature_algorithm_id: u32::from_le_bytes(sig_algo_id_bytes),
+            signature_over_signed_data: signature_bytes.into(),
+        })
+    }
+
+    fn parse_digest(digest_bytes: &[u8]) -> Result<Digest, AppError> {
+        let (sig_algo_id_bytes, digest_data) = digest_bytes
+            .split_at_checked(4)
+            .ok_or(AppError::ParseError("Digest parse error".into()))?;
+        let sig_algo_id_bytes: [u8; 4] = sig_algo_id_bytes.try_into().unwrap();
+        let (digest_bytes, _rem) = parse_u32_len_prefixed_value(digest_data)?; //TODO Return error if bytes remaining
+        Ok(Digest {
+            signature_algorithm_id: u32::from_le_bytes(sig_algo_id_bytes),
+            digest: digest_bytes.into(),
+        })
+    }
+
+    //NOTE Certificate type could change to ASN.1 DER so maintaining this function signature
+    fn parse_certificate(certificate_bytes: &[u8]) -> Result<Certificate, AppError> {
+        Ok(certificate_bytes.into())
+    }
+
+    fn parse_additional_attribute(
+        additional_attribute_bytes: &[u8],
+    ) -> Result<AdditionalAttribute, AppError> {
+        let (id_bytes, value_bytes) =
+            additional_attribute_bytes
+                .split_at_checked(4)
+                .ok_or(AppError::ParseError(
+                    "Additional attribute parse error at ID".into(),
+                ))?;
+        let id_bytes: [u8; 4] = id_bytes.try_into().unwrap();
+        let (value, _rem) = parse_u32_len_prefixed_value(value_bytes)?; //TODO Return error if bytes remaining
+        Ok(AdditionalAttribute {
+            id: u32::from_le_bytes(id_bytes),
+            value: value.into(),
+        })
     }
 }
 
@@ -187,7 +332,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     info!("started");
     let test_path = "fixtures/v2-two-signers.apk";
-    let apk_sig_info = ApkSigInfo::parse(test_path)?;
+    let _apk_sig_info = ApkSigInfo::parse(test_path)?;
     Ok(())
 }
 
